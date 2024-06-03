@@ -1,0 +1,258 @@
+---
+title: "Quantitative proteomics - k-means clustering"
+author: "Thomas Naake"
+format: 
+    html:
+        self-contained: true
+        code-fold: true
+        toc: true
+        toc-depth: 3
+        toc-expand: true
+editor: visual
+---
+
+This example performs k-means clustering on the discovery cohort data set of the publication by Jayavelu et al. (2022): "The proteogenomic subtypes of acute myeloid leukemia" (doi: 10.1016/j.ccell.2022.02.006).
+
+k-means clustering is a popular algorithm used for partitioning a dataset into k distinct, non-overlapping subsets or clusters. The main idea is to define clusters such that the data points within each cluster are more similar to each other than to those in other clusters, based on some distance metric (commonly Euclidean distance).
+
+## How k-means clustering works
+
+1. Initialization:
+
+ - choose the number of clusters k,
+ - randomly select k initial cluster centroids (these can be random points from the data or selected through other methods)
+ 
+2. Assignment Step:
+
+- assign each data point to the nearest cluster centroid. This is typically done using the Euclidean distance,
+- each point is now assigned to a cluster based on the closest centroid
+
+3. Update Step:
+
+- recalculate the centroids of the clusters. The new centroid is the mean of all the points assigned to that cluster,
+- update the positions of the centroids to these new mean positions
+
+4. Iteration:
+
+- repeat the assignment and update steps until convergence. Convergence is 
+  reached when the assignments no longer change or change very little, or 
+  after a fixed number of iterations
+
+# Load libraries
+
+```{r}
+#| message: false
+#| warning: false
+## for preprocessing
+if (!requireNamespace("MatrixQCvis", quietly = TRUE))
+    BiocManager::install("MatrixQCvis")
+library("MatrixQCvis")
+if (!requireNamespace("SummarizedExperiment", quietly = TRUE))
+    BiocManager::install("SummarizedExperiment")
+library("SummarizedExperiment")
+
+## for GSEA
+if (!requireNamespace("clusterProfiler", quietly = TRUE))
+    BiocManager::install("clusterProfiler")
+library("clusterProfiler")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+    BiocManager::install("org.Hs.eg.db")
+library("org.Hs.eg.db")
+if (!requireNamespace("AnnotationDbi", quietly = TRUE))
+    BiocManager::install("AnnotationDbi")
+library("AnnotationDbi")
+if (!requireNamespace("biomaRt", quietly = TRUE))
+    BiocManager::install("biomaRt")
+library("biomaRt")
+```
+
+# Load data set and perform preprocessing
+
+The data set was downloaded from PRIDE database under the ID PXD023201. Here, we will load the dataset and prepare it for analysis.
+
+```{r}
+dia <- read.delim("https://raw.githubusercontent.com/tnaake/AI_MS/main/exercise/data/pxd023201_AML_DIA_proteome.txt", 
+    sep = "\t", header = TRUE)
+
+## create colData
+cD <- dia[1:4, ]
+cD <- cD[, grepl(x = colnames(cD), pattern = "AML")] |>
+    t() |>
+    DataFrame()
+colnames(cD) <- c("Type", "Group1", "OSTM", "EFTM")
+cD[1, 1] <- "E"
+cD[1, 2] <- "Primary"
+cD[1, 3] <- "52.01"
+cD[1, 4] <- "11.576"
+cD$name <- rownames(cD)
+
+## create assay
+a <- dia[-c(1:4), grepl(x = colnames(dia), pattern = "AML")] |>
+    as.matrix()
+mode(a) <- "numeric"
+rownames(a) <- dia[-c(1:4), "PG.UniProtIds"]
+
+## create rowData
+rD <- dia[-c(1:4), !grepl(x = colnames(dia), pattern = "AML")]
+rownames(rD) <- rownames(a)
+
+## create SummarizedExperiment object
+dia <- SummarizedExperiment(assays = list(normalized = a), colData = cD, rowData = rD)
+```
+
+Remove constant/zero variance proteins (rows).
+
+```{r}
+nas <- dia |>
+    assay() |>
+    apply(MARGIN = 1, FUN = sd, na.rm = TRUE)
+nas[is.na(nas)] <- 0
+dia <- dia[nas > 0, ]
+
+## what are the dimensions?
+dim(dia)
+```
+
+Keep proteins with more than 80% measured values.
+
+```{r keep_measured_ff_proteomics}
+measured <- apply(assay(dia), 1, function(rows_i) sum(!is.na(rows_i)))
+dia <- dia[measured > (ncol(dia) * 0.80), ]
+
+## what are the dimensions?
+dim(dia)
+```
+
+## Perform QA/QC
+
+```{r}
+#| eval: false
+shinyQC(dia)
+```
+
+Some samples look a bit off (e.g. based on number of missing values, ECDF, dimension reduction plot). Remove them in the following.
+
+```{r remove_samples}
+.selection <-  c(
+    "AML_293", "AML_310", "AML_334", "AML_301", "AML_309", "AML_304")
+dia <- MatrixQCvis:::selectSampleSE(dia, 
+    selection = .selection, mode = "exclude")
+```
+
+# Perform k-means clustering
+
+Perform k-means clustering. Iterate over several values of k and store the total within sum-of-squares per iteration.
+
+```{r}
+#| warning: false
+## k-means requires complete datasets, impute using MinDet
+assay(dia, "imputed") <- dia |>
+    assay() |>
+    imputeAssay(method = "MinDet")
+
+## create vector to store results
+ks <- 15
+wcss <- numeric(ks)
+
+## iterate over several values of k
+for (k in seq_len(ks)) {
+    model <- kmeans(assay(dia, "imputed"), centers = k, 
+        iter.max = 10000)
+    wcss[k] <- model$tot.withinss
+}
+
+## visaulize Elbow method
+ggplot(data.frame(k = seq_len(ks), wcss = wcss), aes(x = k, y = wcss)) +
+    geom_point() +
+    geom_line() +
+    ggtitle("Elbow method for optimal k") +
+    xlab("number of clusters") +
+    ylab("within-cluster sum of squares (WCSS)")
+```
+
+## Determine final clusters
+
+According to the "elbow", the optimal number of clusters is 3 or 4.
+
+Run again the k-means algorithm with `k = 4`.
+
+```{r}
+model <- kmeans(assay(dia, "imputed"), centers = 4, 
+    iter.max = 10000)
+```
+
+Show the distribution of clusters:
+
+```{r}
+table(model$cluster)
+```
+
+# Perform enrichment
+
+Convert UniProt ids to Entrez gene ids.
+
+Translation of UNIPROT into gene names, ENSEMBL gene ids, and ENTREZ gene ids.
+
+To facilitate the biological interpretation, we will translate here the UNIPROT ids into SYMBOL, ENSEMBLE and Entrezgene IDs.
+
+Get the IDs from `biomaRt`.
+
+```{r biomart_translation_ff_proteomics, cache = TRUE}
+## find the suitable genome
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+.datasets <- listDatasets(ensembl)
+.datasets[grep(.datasets$version, pattern = "GRCh38"), ]
+
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", 
+    dataset = "hsapiens_gene_ensembl")
+
+## go through the individual datasets and translate the ids 
+.attributes <- c("ensembl_gene_id", "hgnc_symbol", 
+    "external_gene_name","uniprot_gn_id", "entrezgene_id")
+```
+
+Do then the actual translation for `dia`.
+
+```{r biomart_translation_ff_proteomics_translate}
+## dia
+query <- rownames(dia) |>
+    strsplit(split = ";") |>
+    lapply(function(gene_i) unique(stringr::str_remove(gene_i, pattern = "[-][0-9]+")))
+bm <- getBM(attributes = .attributes, filters = "", mart = mart)
+.names <- lapply(query, function(gene_i) {
+    inds <- which(bm[, "uniprot_gn_id"] %in% gene_i)
+    apply(bm[inds, ], 2, function(cols_j) {
+        ids <- cols_j |>
+            unique() |>
+            stringr::str_trim(side = "both")
+        ids <- ids[!is.na(ids)]
+        ids[1]
+    })
+})
+.names_df <- do.call("rbind", .names)
+colnames(.names_df) <- paste0("biomaRt_", colnames(.names_df))
+rowData(dia) <- rowData(dia) |> 
+    cbind(.names_df)
+```
+
+Look into cluster 1.
+
+```{r}
+cluster <- 1
+universe <- rowData(dia)[names(model$cluster), "biomaRt_entrezgene_id"]
+fg <- names(model$cluster[model$cluster == cluster])
+fg <- rowData(dia)[fg, "biomaRt_entrezgene_id"]
+```
+
+Perform GSEA.
+
+```{r}
+gsea_results <- enrichGO(gene = fg, universe = universe,
+    OrgDb = org.Hs.eg.db, ont = "BP" )
+```
+
+Visualize the results.
+
+```{r}
+dotplot(gsea_results)
+```
